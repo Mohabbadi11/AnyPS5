@@ -263,5 +263,26 @@ int main() {
     const GuestSignalSet empty{{0, 0, 0, 0}};
     Require(sigismember_nid_postfix(&empty, 1) == 0);
     Require(sigismember_nid_postfix(&empty, 128) == 0);
+
+    for (const int signal : {1, 32, 64, 128}) {
+        *__error_nid_postfix() = 0;
+        Require(sigaddset_nid_postfix(nullptr, signal) == -1 && *__error_nid_postfix() == 22);
+        *__error_nid_postfix() = 0;
+        Require(sigdelset_nid_postfix(nullptr, signal) == -1 && *__error_nid_postfix() == 22);
+        *__error_nid_postfix() = 0;
+        Require(sigismember_nid_postfix(nullptr, signal) == -1 && *__error_nid_postfix() == 22);
+    }
+    *__error_nid_postfix() = 0;
+    Require(sigemptyset_nid_postfix(nullptr) == -1 && *__error_nid_postfix() == 22);
+    *__error_nid_postfix() = 0;
+    Require(sigfillset_nid_postfix(nullptr) == -1 && *__error_nid_postfix() == 22);
+    for (const int invalid : {0, -1, 129, 1000, INT_MIN, INT_MAX}) {
+        *__error_nid_postfix() = 0;
+        Require(sigaddset_nid_postfix(nullptr, invalid) == -1 && *__error_nid_postfix() == 22);
+        *__error_nid_postfix() = 0;
+        Require(sigdelset_nid_postfix(nullptr, invalid) == -1 && *__error_nid_postfix() == 22);
+        *__error_nid_postfix() = 0;
+        Require(sigismember_nid_postfix(nullptr, invalid) == -1 && *__error_nid_postfix() == 22);
+    }
     return 0;
 }
