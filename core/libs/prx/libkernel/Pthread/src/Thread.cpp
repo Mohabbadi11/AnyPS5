@@ -381,9 +381,18 @@ static CpuClockRegistry& CpuClocks() {
 PthreadPrivate::PthreadPrivate(const PthreadAttrPrivate* attr) : _finished(false), _retval(nullptr), _detached(false), _adopted(false), _handleStorage(nullptr), _joined(false) {
     auto& registry = CpuClocks();
     std::lock_guard lock(registry.lock);
+    if (attr && attr->_affinityExplicit) {
+        const KernelCpumask mask = attr->_affinity;
+        if (mask == 0 || (mask & ~registry.processAffinity) != 0)
+            throw std::invalid_argument("Invalid explicit thread affinity");
+    }
     const auto* parent = CurrentGuestState().current;
     const KernelCpumask inherited = parent ? parent->affinity.load(std::memory_order_relaxed) : registry.processAffinity;
-    affinity.store(attr && attr->_affinityExplicit ? attr->_affinity : inherited, std::memory_order_relaxed);
+    const bool isExplicit = (attr && attr->_affinityExplicit) || (parent && parent->explicitAffinity.load(std::memory_order_relaxed));
+    explicitAffinity.store(isExplicit, std::memory_order_relaxed);
+    const KernelCpumask requested = attr && attr->_affinityExplicit ? attr->_affinity : inherited;
+    const KernelCpumask clamped = requested & registry.processAffinity;
+    affinity.store(clamped != 0 ? clamped : registry.processAffinity, std::memory_order_relaxed);
     constexpr int ExplicitSched = 0;
     const bool explicitSched = attr && attr->_inheritsched == ExplicitSched;
     const int inheritedPolicy = parent ? parent->schedPolicy.load(std::memory_order_relaxed) : schedPolicy.load(std::memory_order_relaxed);
@@ -421,13 +430,38 @@ int GuestThreadCpuClockId(const PthreadPrivate* thread) {
     return static_cast<int>(CPU_CLOCK_BIT | static_cast<std::uint32_t>(thread->cpuClockThread));
 }
 
-void SetLiveGuestThreadsAffinity(KernelCpumask mask) {
+bool SetLiveGuestThreadsAffinity(KernelCpumask mask) {
     auto& registry = CpuClocks();
     std::lock_guard lock(registry.lock);
+    if ((mask & ~registry.processAffinity) != 0) return false;
+    for (const auto& [id, thread] : registry.threads) {
+        if (!thread->_finished.load(std::memory_order_acquire)) {
+            thread->affinity.store(mask, std::memory_order_relaxed);
+            thread->explicitAffinity.store(true, std::memory_order_relaxed);
+        }
+    }
+    return true;
+}
+
+bool SetLiveGuestProcessCpuset(KernelCpumask mask) {
+    auto& registry = CpuClocks();
+    std::lock_guard lock(registry.lock);
+    for (const auto& [id, thread] : registry.threads) {
+        if (thread->_finished.load(std::memory_order_acquire)) continue;
+        if (thread->explicitAffinity.load(std::memory_order_relaxed)) {
+            if ((thread->affinity.load(std::memory_order_relaxed) & mask) == 0) return false;
+        }
+    }
     registry.processAffinity = mask;
     for (const auto& [id, thread] : registry.threads) {
-        if (!thread->_finished.load(std::memory_order_acquire)) thread->affinity.store(mask, std::memory_order_relaxed);
+        if (thread->_finished.load(std::memory_order_acquire)) continue;
+        if (thread->explicitAffinity.load(std::memory_order_relaxed)) {
+            thread->affinity.store(thread->affinity.load(std::memory_order_relaxed) & mask, std::memory_order_relaxed);
+        } else {
+            thread->affinity.store(mask, std::memory_order_relaxed);
+        }
     }
+    return true;
 }
 
 KernelCpumask LiveGuestThreadsAffinity() {
@@ -438,6 +472,12 @@ KernelCpumask LiveGuestThreadsAffinity() {
         if (!thread->_finished.load(std::memory_order_acquire)) mask |= thread->affinity.load(std::memory_order_relaxed);
     }
     return mask;
+}
+
+KernelCpumask GuestProcessCpusetAffinity() {
+    auto& registry = CpuClocks();
+    std::lock_guard lock(registry.lock);
+    return registry.processAffinity;
 }
 
 std::unique_lock<std::mutex> LockLiveGuestThread(const PthreadPrivate* thread) {
@@ -464,15 +504,25 @@ bool GetLiveGuestThreadAffinity_nid_no_patch(std::int64_t tid, KernelCpumask& ma
     return false;
 }
 
-bool SetLiveGuestThreadAffinity_nid_no_patch(std::int64_t tid, KernelCpumask mask) {
+int SetLiveGuestThreadAffinity_nid_no_patch(std::int64_t tid, KernelCpumask mask) {
     auto& registry = CpuClocks();
     std::lock_guard lock(registry.lock);
+    bool found = false;
+    for (const auto& [id, thread] : registry.threads) {
+        if (thread->tid == tid && !thread->_finished.load(std::memory_order_acquire)) {
+            found = true;
+            break;
+        }
+    }
+    if (!found) return 3;
+    if ((mask & ~registry.processAffinity) != 0) return 22;
     for (const auto& [id, thread] : registry.threads) {
         if (thread->tid != tid || thread->_finished.load(std::memory_order_acquire)) continue;
         thread->affinity.store(mask, std::memory_order_relaxed);
-        return true;
+        thread->explicitAffinity.store(true, std::memory_order_relaxed);
+        return 0;
     }
-    return false;
+    return 3;
 }
 
 bool LiveGuestThreadExists(std::int64_t tid) {
@@ -821,7 +871,12 @@ extern "C" {
 int APS5_VABI scePthreadCreate(Pthread* thread, const PthreadAttr* attr, PthreadEntry entry, void* arg, const char* name) {
     if (!thread || !entry) throw std::runtime_error("scePthreadCreate: null arg");
     if (attr && !*attr) attr = nullptr;
-    auto p = std::make_unique<PthreadPrivate>(attr ? *attr : nullptr);
+    std::unique_ptr<PthreadPrivate> p;
+    try {
+        p = std::make_unique<PthreadPrivate>(attr ? *attr : nullptr);
+    } catch (const std::invalid_argument&) {
+        return SCE_KERNEL_ERROR_EINVAL;
+    }
     bool detached = false;
     if (attr && *attr) detached = ((*attr)->_detachstate == DETACH_DETACHED);
     p->_detached = detached;
@@ -1162,7 +1217,11 @@ int APS5_VABI scePthreadRename(Pthread thread, const char* name) {
 
 int APS5_VABI scePthreadSetaffinity(Pthread thread, KernelCpumask mask) {
     if (!thread || mask == 0) return SCE_KERNEL_ERROR_EINVAL;
+    auto& registry = CpuClocks();
+    std::lock_guard lock(registry.lock);
+    if ((mask & ~registry.processAffinity) != 0) return SCE_KERNEL_ERROR_EINVAL;
     thread->affinity.store(mask, std::memory_order_relaxed);
+    thread->explicitAffinity.store(true, std::memory_order_relaxed);
     return SCE_OK;
 }
 
